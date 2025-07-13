@@ -3,11 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -57,6 +57,11 @@ type AppData struct {
 	Glossary     []GlossaryItem `json:"glossary"`
 }
 
+type statusMsg struct {
+	message string
+	color   string
+}
+
 // Model
 type model struct {
 	activeTab    int
@@ -67,17 +72,20 @@ type model struct {
 	editingRow   int
 	editingField int
 	inputs       []textinput.Model
-	message      string
+	statusMsg    string
+	statusColor  string
+	statusExpiry time.Time
 	width        int
 	height       int
 }
 
-// Styles
+// Enhanced styles with better color coding
 var (
+	// Tab styles
 	tabStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("39")).
-			Background(lipgloss.Color("57")).
+			Background(lipgloss.Color("236")).
 			PaddingLeft(1).
 			PaddingRight(1)
 
@@ -88,32 +96,38 @@ var (
 			PaddingLeft(1).
 			PaddingRight(1)
 
-	tableStyle = lipgloss.NewStyle().
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(lipgloss.Color("240"))
+	// Priority color styles
+	priorityHighStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true) // Red
+	priorityMedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true) // Yellow
+	priorityLowStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true)  // Green
 
+	// Status color styles
+	statusDoneStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true)  // Green
+	statusPendingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Bold(true) // Yellow
+	statusOverdueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true) // Red
+
+	// Command styles
+	keyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))  // Blue
+	actionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))  // Green
+	bulletStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240")) // Gray
+
+	// Header style
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("211")).
-			Background(lipgloss.Color("57"))
-
-	selectedStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("229")).
-			Background(lipgloss.Color("57"))
-
-	commandStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("39")).
-			Background(lipgloss.Color("236"))
-
-	priorityHighStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	priorityMedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("226"))
-	priorityLowStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
+			Foreground(lipgloss.Color("86"))
 )
+
+func showStatus(msg string, color string) tea.Cmd {
+	return func() tea.Msg {
+		return statusMsg{message: msg, color: color}
+	}
+}
 
 func initialModel() model {
 	m := model{
-		activeTab: 1,
-		data:      loadData(),
+		activeTab:   1,
+		data:        loadData(),
+		statusColor: "86",
 	}
 
 	m.setupTables()
@@ -128,60 +142,61 @@ func (m *model) setupTables() {
 			{Title: "Priority", Width: 10},
 			{Title: "Category", Width: 15},
 			{Title: "Deadline", Width: 12},
-			{Title: "Status", Width: 12},
+			{Title: "Status", Width: 25},
 		}),
 		table.WithRows(m.dailyRows()),
 		table.WithFocused(true),
-		table.WithHeight(10),
+		table.WithHeight(15),
 	)
 
 	// Tab 3: Rolling Todos
 	m.tables[1] = table.New(
 		table.WithColumns([]table.Column{
-			{Title: "Task", Width: 35},
+			{Title: "Task", Width: 40},
 			{Title: "Priority", Width: 10},
 			{Title: "Category", Width: 15},
 			{Title: "Deadline", Width: 15},
 		}),
 		table.WithRows(m.rollingRows()),
 		table.WithFocused(true),
-		table.WithHeight(10),
+		table.WithHeight(15),
 	)
 
 	// Tab 4: Reminders
 	m.tables[2] = table.New(
 		table.WithColumns([]table.Column{
-			{Title: "Reminder", Width: 25},
-			{Title: "Note", Width: 30},
+			{Title: "Reminder", Width: 30},
+			{Title: "Note", Width: 35},
 			{Title: "Alarm/Countdown", Width: 15},
 			{Title: "Status", Width: 10},
 		}),
 		table.WithRows(m.reminderRows()),
 		table.WithFocused(true),
-		table.WithHeight(10),
+		table.WithHeight(15),
 	)
 
 	// Tab 5: Glossary
 	m.tables[3] = table.New(
 		table.WithColumns([]table.Column{
 			{Title: "Lang", Width: 8},
-			{Title: "Command", Width: 15},
-			{Title: "Usage", Width: 20},
-			{Title: "Example", Width: 20},
-			{Title: "Meaning", Width: 20},
+			{Title: "Command", Width: 18},
+			{Title: "Usage", Width: 25},
+			{Title: "Example", Width: 25},
+			{Title: "Meaning", Width: 25},
 		}),
 		table.WithRows(m.glossaryRows()),
 		table.WithFocused(true),
-		table.WithHeight(10),
+		table.WithHeight(15),
 	)
 
-	// Apply styles
+	// Apply modern table styles
 	s := table.DefaultStyles()
 	s.Header = s.Header.
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("240")).
 		BorderBottom(true).
-		Bold(false)
+		Bold(true).
+		Foreground(lipgloss.Color("86"))
 	s.Selected = s.Selected.
 		Foreground(lipgloss.Color("229")).
 		Background(lipgloss.Color("57")).
@@ -189,6 +204,22 @@ func (m *model) setupTables() {
 
 	for i := range m.tables {
 		m.tables[i].SetStyles(s)
+	}
+}
+
+func (m *model) adjustLayout() {
+	if m.width == 0 || m.height == 0 {
+		return
+	}
+
+	tableHeight := m.height - 8
+	if tableHeight < 10 {
+		tableHeight = 10
+	}
+
+	// Adjust table heights
+	for i := range m.tables {
+		m.tables[i].SetHeight(tableHeight)
 	}
 }
 
@@ -205,12 +236,20 @@ func (m *model) dailyRows() []table.Row {
 			priority = priorityLowStyle.Render(priority)
 		}
 
+		status := daily.Status
+		switch status {
+		case "DONE":
+			status = statusDoneStyle.Render(status)
+		default:
+			status = statusOverdueStyle.Render("INCOMPLETE")
+		}
+
 		rows = append(rows, table.Row{
 			daily.Task,
 			priority,
 			daily.Category,
 			daily.Deadline,
-			daily.Status,
+			status,
 		})
 	}
 	return rows
@@ -242,11 +281,21 @@ func (m *model) rollingRows() []table.Row {
 func (m *model) reminderRows() []table.Row {
 	rows := []table.Row{}
 	for _, reminder := range m.data.Reminders {
+		status := reminder.Status
+		switch status {
+		case "Active":
+			status = statusPendingStyle.Render(status)
+		case "Completed", "Done":
+			status = statusDoneStyle.Render(status)
+		case "Expired":
+			status = statusOverdueStyle.Render(status)
+		}
+
 		rows = append(rows, table.Row{
 			reminder.Reminder,
 			reminder.Note,
 			reminder.AlarmOrCountdown,
-			reminder.Status,
+			status,
 		})
 	}
 	return rows
@@ -266,15 +315,57 @@ func (m *model) glossaryRows() []table.Row {
 	return rows
 }
 
+func (m *model) toggleCompletion() {
+	if m.activeTab != 2 || len(m.data.Dailies) == 0 {
+		return
+	}
+
+	cursor := m.tables[0].Cursor()
+	if cursor >= len(m.data.Dailies) {
+		return
+	}
+
+	current := m.data.Dailies[cursor].Status
+	var newStatus string
+
+	switch current {
+	case "DONE":
+		newStatus = "INCOMPLETE"
+	default:
+		newStatus = "DONE"
+	}
+
+	m.data.Dailies[cursor].Status = newStatus
+	m.tables[0].SetRows(m.dailyRows())
+	saveData(m.data)
+
+	statusColor := "86"
+	if newStatus == "DONE" {
+		statusColor = "82"
+	} else {
+		statusColor = "196"
+	}
+	m.statusMsg = fmt.Sprintf("✅ Task marked as %s", newStatus)
+	m.statusColor = statusColor
+	m.statusExpiry = time.Now().Add(3 * time.Second)
+}
+
 func (m model) Init() tea.Cmd {
 	return nil
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case statusMsg:
+		m.statusMsg = msg.message
+		m.statusColor = msg.color
+		m.statusExpiry = time.Now().Add(3 * time.Second)
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.adjustLayout()
 		return m, nil
 
 	case tea.KeyMsg:
@@ -295,6 +386,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activeTab = 4
 		case "5":
 			m.activeTab = 5
+		case "left":
+			if m.activeTab > 1 {
+				m.activeTab--
+			} else if m.activeTab == 1 {
+				m.activeTab = 5
+			}
+		case "right":
+			if m.activeTab < 5 {
+				m.activeTab++
+			} else if m.activeTab == 5 {
+				m.activeTab = 1
+			}
 		case "up", "k":
 			if m.activeTab > 1 && m.activeTab < 6 {
 				m.tables[m.activeTab-2], _ = m.tables[m.activeTab-2].Update(msg)
@@ -315,6 +418,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.activeTab > 1 && m.activeTab < 6 {
 				m.deleteSelected()
 			}
+		case " ", "enter":
+			// Toggle completion for dailies
+			if m.activeTab == 2 {
+				m.toggleCompletion()
+			}
+
 		}
 	}
 
@@ -326,14 +435,12 @@ func (m model) handleEditingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.editing = false
 		m.inputs = nil
-		m.message = ""
-		return m, nil
+		return m, showStatus("❌ Edit cancelled", "196")
 	case "enter":
 		m.saveEdit()
 		m.editing = false
 		m.inputs = nil
-		m.message = "Changes saved"
-		return m, nil
+		return m, showStatus("✅ Changes saved", "82")
 	case "tab":
 		if len(m.inputs) > 0 {
 			m.editingField = (m.editingField + 1) % len(m.inputs)
@@ -363,14 +470,14 @@ func (m model) handleEditingKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) startEditing() {
 	m.editing = true
 	m.editingTab = m.activeTab
-	m.editingRow = m.tables[m.activeTab-1].Cursor()
+	m.editingRow = m.tables[m.activeTab-2].Cursor()
 	m.editingField = 0
 
 	switch m.editingTab {
 	case 2: // Dailies
 		if m.editingRow < len(m.data.Dailies) {
 			daily := m.data.Dailies[m.editingRow]
-			m.inputs = make([]textinput.Model, 5)
+			m.inputs = make([]textinput.Model, 4)
 			m.inputs[0] = textinput.New()
 			m.inputs[0].SetValue(daily.Task)
 			m.inputs[0].Focus()
@@ -380,8 +487,6 @@ func (m *model) startEditing() {
 			m.inputs[2].SetValue(daily.Category)
 			m.inputs[3] = textinput.New()
 			m.inputs[3].SetValue(daily.Deadline)
-			m.inputs[4] = textinput.New()
-			m.inputs[4].SetValue(daily.Status)
 		}
 	case 3: // Rolling Todos
 		if m.editingRow < len(m.data.RollingTodos) {
@@ -438,7 +543,7 @@ func (m *model) addNew() {
 
 	switch m.activeTab {
 	case 2: // Dailies
-		m.inputs = make([]textinput.Model, 5)
+		m.inputs = make([]textinput.Model, 4)
 		for i := range m.inputs {
 			m.inputs[i] = textinput.New()
 		}
@@ -475,7 +580,7 @@ func (m *model) saveEdit() {
 				Priority: m.inputs[1].Value(),
 				Category: m.inputs[2].Value(),
 				Deadline: m.inputs[3].Value(),
-				Status:   m.inputs[4].Value(),
+				Status:   "INCOMPLETE",
 			}
 			m.data.Dailies = append(m.data.Dailies, newDaily)
 		} else {
@@ -484,7 +589,6 @@ func (m *model) saveEdit() {
 			m.data.Dailies[m.editingRow].Priority = m.inputs[1].Value()
 			m.data.Dailies[m.editingRow].Category = m.inputs[2].Value()
 			m.data.Dailies[m.editingRow].Deadline = m.inputs[3].Value()
-			m.data.Dailies[m.editingRow].Status = m.inputs[4].Value()
 		}
 		m.tables[0].SetRows(m.dailyRows())
 	case 3: // Rolling Todos
@@ -551,34 +655,52 @@ func (m *model) deleteSelected() {
 	switch m.activeTab {
 	case 2: // Dailies
 		if cursor < len(m.data.Dailies) {
+			taskName := m.data.Dailies[cursor].Task
 			m.data.Dailies = append(m.data.Dailies[:cursor], m.data.Dailies[cursor+1:]...)
 			m.tables[0].SetRows(m.dailyRows())
+			m.statusMsg = fmt.Sprintf("🗑️ Deleted: %s", taskName)
+			m.statusColor = "196"
+			m.statusExpiry = time.Now().Add(3 * time.Second)
 		}
 	case 3: // Rolling Todos
 		if cursor < len(m.data.RollingTodos) {
+			taskName := m.data.RollingTodos[cursor].Task
 			m.data.RollingTodos = append(m.data.RollingTodos[:cursor], m.data.RollingTodos[cursor+1:]...)
 			m.tables[1].SetRows(m.rollingRows())
+			m.statusMsg = fmt.Sprintf("🗑️ Deleted: %s", taskName)
+			m.statusColor = "196"
+			m.statusExpiry = time.Now().Add(3 * time.Second)
 		}
 	case 4: // Reminders
 		if cursor < len(m.data.Reminders) {
+			reminderName := m.data.Reminders[cursor].Reminder
 			m.data.Reminders = append(m.data.Reminders[:cursor], m.data.Reminders[cursor+1:]...)
 			m.tables[2].SetRows(m.reminderRows())
+			m.statusMsg = fmt.Sprintf("🗑️ Deleted: %s", reminderName)
+			m.statusColor = "196"
+			m.statusExpiry = time.Now().Add(3 * time.Second)
 		}
 	case 5: // Glossary
 		if cursor < len(m.data.Glossary) {
+			itemName := m.data.Glossary[cursor].Command
 			m.data.Glossary = append(m.data.Glossary[:cursor], m.data.Glossary[cursor+1:]...)
 			m.tables[3].SetRows(m.glossaryRows())
+			m.statusMsg = fmt.Sprintf("🗑️ Deleted: %s", itemName)
+			m.statusColor = "196"
+			m.statusExpiry = time.Now().Add(3 * time.Second)
 		}
 	}
 
 	saveData(m.data)
-	m.message = "Item deleted"
 }
 
 func (m model) View() string {
 	if m.editing {
 		return m.editView()
 	}
+
+	// Header
+	header := headerStyle.Render("📋 lif2 - lucas is forgetful")
 
 	// Tab headers
 	tabs := []string{}
@@ -597,41 +719,64 @@ func (m model) View() string {
 	var content string
 
 	if m.activeTab == 1 {
-		// Home page
+		// Enhanced home page with summary
 		homeContent := lipgloss.NewStyle().
-			Padding(2).
-			Render("Welcome to Daily Tasks & Reminders")
+			Padding(1).
+			Render("Welcome to the LIF Dailies/Reminders Management Dashboard!")
+
+		// Show summary stats
+		totalDailies := len(m.data.Dailies)
+		completedDailies := 0
+		for _, daily := range m.data.Dailies {
+			if daily.Status == "DONE" {
+				completedDailies++
+			}
+		}
+		summary := fmt.Sprintf("\nStats:\n")
+		summary += fmt.Sprintf("  • Daily Tasks: %d total, %d completed\n", totalDailies, completedDailies)
+		summary += fmt.Sprintf("  • Rolling Todos: %d items\n", len(m.data.RollingTodos))
+		summary += fmt.Sprintf("  • Reminders: %d active\n", len(m.data.Reminders))
+		summary += fmt.Sprintf("  • Glossary: %d entries\n", len(m.data.Glossary))
 
 		if len(m.data.RollingTodos) > 0 {
-			homeContent += "\n\n" + priorityHighStyle.Render("You still have things on your Rolling Todo!")
+			summary += "\n" + priorityHighStyle.Render("You have items in your Rolling Todo List!")
 		}
 
-		content = homeContent
+		content = homeContent + summary
 	} else {
 		// Table content
-		content = tableStyle.Render(m.tables[m.activeTab-2].View())
+		content = m.tables[m.activeTab-2].View()
 	}
 
-	// Commands
-	commands := []string{}
+	// Enhanced footer with color coding
+	var commands []string
 	if m.activeTab == 1 {
-		commands = append(commands, "1-5: navigate tabs")
+		commands = append(commands, keyStyle.Render("1-5")+": "+actionStyle.Render("navigate"))
 	} else {
-		commands = append(commands, "1-5: navigate tabs", "↑↓: navigate", "e: edit", "n/a: add", "d: delete")
+		commands = append(commands, keyStyle.Render("↑↓")+": "+actionStyle.Render("navigate"))
+		commands = append(commands, keyStyle.Render("e")+": "+actionStyle.Render("edit"))
+		commands = append(commands, keyStyle.Render("n/a")+": "+actionStyle.Render("add"))
+		commands = append(commands, keyStyle.Render("d")+": "+actionStyle.Render("delete"))
+		if m.activeTab == 2 {
+			commands = append(commands, keyStyle.Render("space/enter")+": "+actionStyle.Render("toggle done"))
+		}
 	}
-	commands = append(commands, "q: quit")
+	commands = append(commands, keyStyle.Render("q")+": "+actionStyle.Render("quit"))
 
-	commandRow := commandStyle.Render("Commands: " + strings.Join(commands, " • "))
+	commandRow := strings.Join(commands, bulletStyle.Render(" • "))
 
-	if m.message != "" {
-		commandRow += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Render(m.message)
+	// Status message with expiry
+	if m.statusMsg != "" && time.Now().Before(m.statusExpiry) {
+		statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.statusColor))
+		commandRow += "\n> " + statusStyle.Render(m.statusMsg)
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Top,
+		header,
+		"",
 		tabRow,
-		lipgloss.NewStyle().Border(lipgloss.NormalBorder(), true, false, false, false).BorderForeground(lipgloss.Color("240")).Render(""),
 		content,
-		lipgloss.NewStyle().Border(lipgloss.NormalBorder(), true, false, false, false).BorderForeground(lipgloss.Color("240")).Render(""),
+		"",
 		commandRow,
 	)
 }
@@ -652,16 +797,17 @@ func (m model) editView() string {
 	}
 
 	for i, input := range m.inputs {
-		label := lipgloss.NewStyle().Bold(true).Render(labels[i])
+		label := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86")).Render(labels[i])
 		fields = append(fields, label+"\n"+input.View())
 	}
 
 	content := lipgloss.JoinVertical(lipgloss.Top, fields...)
 
-	footer := commandStyle.Render("Commands: tab: next field • shift+tab: prev field • enter: save • esc: cancel")
+	header := headerStyle.Render("✏️ Editing Mode")
+	footer := keyStyle.Render("tab") + ": " + actionStyle.Render("next field") + " " + bulletStyle.Render("•") + " " + keyStyle.Render("shift+tab") + ": " + actionStyle.Render("prev field") + " " + bulletStyle.Render("•") + " " + keyStyle.Render("enter") + ": " + actionStyle.Render("save") + " " + bulletStyle.Render("•") + " " + keyStyle.Render("esc") + ": " + actionStyle.Render("cancel")
 
 	return lipgloss.JoinVertical(lipgloss.Top,
-		lipgloss.NewStyle().Bold(true).Render("Editing"),
+		header,
 		"",
 		content,
 		"",
@@ -693,7 +839,7 @@ func loadData() AppData {
 		return data
 	}
 
-	file, err := ioutil.ReadFile(configPath)
+	file, err := os.ReadFile(configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -715,7 +861,7 @@ func saveData(data AppData) {
 		log.Fatal(err)
 	}
 
-	err = ioutil.WriteFile(configPath, file, 0644)
+	err = os.WriteFile(configPath, file, 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
