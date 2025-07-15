@@ -700,7 +700,7 @@ func (m model) View() string {
 	}
 
 	// Header
-	header := headerStyle.Render("📋 lif2 - lucas is forgetful")
+	header := headerStyle.Render("📋 lif - lucas is forgetful")
 
 	// Tab headers
 	tabs := []string{}
@@ -722,7 +722,7 @@ func (m model) View() string {
 		// Enhanced home page with summary
 		homeContent := lipgloss.NewStyle().
 			Padding(1).
-			Render("Welcome to the LIF Dailies/Reminders Management Dashboard!")
+			Render("Welcome to lif - Dailies/Reminders Management Dashboard!")
 
 		// Show summary stats
 		totalDailies := len(m.data.Dailies)
