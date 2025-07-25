@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,12 +21,13 @@ import (
 
 // Data structures
 type Daily struct {
-	ID       int    `json:"id"`
-	Task     string `json:"task"`
-	Priority string `json:"priority"`
-	Category string `json:"category"`
-	Deadline string `json:"deadline"`
-	Status   string `json:"status"`
+	ID            int       `json:"id"`
+	Task          string    `json:"task"`
+	Priority      string    `json:"priority"`
+	Category      string    `json:"category"`
+	Deadline      string    `json:"deadline"`
+	Status        string    `json:"status"`
+	LastCompleted time.Time `json:"last_completed"`
 }
 
 type RollingTodo struct {
@@ -34,11 +39,16 @@ type RollingTodo struct {
 }
 
 type Reminder struct {
-	ID               int    `json:"id"`
-	Reminder         string `json:"reminder"`
-	Note             string `json:"note"`
-	AlarmOrCountdown string `json:"alarm_or_countdown"`
-	Status           string `json:"status"`
+	ID               int           `json:"id"`
+	Reminder         string        `json:"reminder"`
+	Note             string        `json:"note"`
+	AlarmOrCountdown string        `json:"alarm_or_countdown"`
+	Status           string        `json:"status"`
+	CreatedAt        time.Time     `json:"created_at"`
+	TargetTime       time.Time     `json:"target_time"`
+	IsCountdown      bool          `json:"is_countdown"`
+	Notified         bool          `json:"notified"`
+	PausedRemaining  time.Duration `json:"paused_remaining"`
 }
 
 type GlossaryItem struct {
@@ -62,21 +72,30 @@ type statusMsg struct {
 	color   string
 }
 
+type tickMsg time.Time
+
+type notificationMsg struct {
+	reminder Reminder
+}
+
 // Model
 type model struct {
-	activeTab    int
-	tables       [4]table.Model
-	data         AppData
-	editing      bool
-	editingTab   int
-	editingRow   int
-	editingField int
-	inputs       []textinput.Model
-	statusMsg    string
-	statusColor  string
-	statusExpiry time.Time
-	width        int
-	height       int
+	activeTab     int
+	tables        [4]table.Model
+	data          AppData
+	editing       bool
+	editingTab    int
+	editingRow    int
+	editingField  int
+	inputs        []textinput.Model
+	statusMsg     string
+	statusColor   string
+	statusExpiry  time.Time
+	width         int
+	height        int
+	lastTick      time.Time
+	confirmDelete bool
+	deleteTarget  string
 }
 
 // Enhanced styles with better color coding
@@ -123,11 +142,319 @@ func showStatus(msg string, color string) tea.Cmd {
 	}
 }
 
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+func normalizeText(text string) string {
+	return strings.ToLower(strings.TrimSpace(text))
+}
+
+func normalizePriority(priority string) string {
+	norm := strings.ToUpper(strings.TrimSpace(priority))
+	switch norm {
+	case "HIGH", "H":
+		return "HIGH"
+	case "MEDIUM", "MED", "M":
+		return "MEDIUM"
+	case "LOW", "L":
+		return "LOW"
+	default:
+		// Handle legacy values
+		lower := strings.ToLower(norm)
+		if strings.Contains(lower, "high") {
+			return "HIGH"
+		} else if strings.Contains(lower, "low") {
+			return "LOW"
+		}
+		return "MEDIUM"
+	}
+}
+
+func parseCountdown(countdownStr string) (time.Time, bool) {
+	// Days format (1d, 5d, 20d)
+	if strings.HasSuffix(countdownStr, "d") {
+		dayStr := strings.TrimSuffix(countdownStr, "d")
+		if days, err := strconv.Atoi(dayStr); err == nil {
+			return time.Now().Add(time.Duration(days) * 24 * time.Hour), true
+		}
+	}
+
+	// Weeks format (1w, 2w)
+	if strings.HasSuffix(countdownStr, "w") {
+		weekStr := strings.TrimSuffix(countdownStr, "w")
+		if weeks, err := strconv.Atoi(weekStr); err == nil {
+			return time.Now().Add(time.Duration(weeks) * 7 * 24 * time.Hour), true
+		}
+	}
+
+	// Minutes format (1m, 30m, min)
+	if strings.HasSuffix(countdownStr, "m") || strings.HasSuffix(countdownStr, "min") {
+		minStr := strings.TrimSuffix(strings.TrimSuffix(countdownStr, "min"), "m")
+		if minutes, err := strconv.Atoi(minStr); err == nil {
+			return time.Now().Add(time.Duration(minutes) * time.Minute), true
+		}
+	}
+
+	// Hours format (1h, 2h, hr)
+	if strings.HasSuffix(countdownStr, "h") || strings.HasSuffix(countdownStr, "hr") {
+		hourStr := strings.TrimSuffix(strings.TrimSuffix(countdownStr, "hr"), "h")
+		if hours, err := strconv.Atoi(hourStr); err == nil {
+			return time.Now().Add(time.Duration(hours) * time.Hour), true
+		}
+	}
+
+	// Seconds format (1s, 30s, sec)
+	if strings.HasSuffix(countdownStr, "s") || strings.HasSuffix(countdownStr, "sec") {
+		secStr := strings.TrimSuffix(strings.TrimSuffix(countdownStr, "sec"), "s")
+		if seconds, err := strconv.Atoi(secStr); err == nil {
+			return time.Now().Add(time.Duration(seconds) * time.Second), true
+		}
+	}
+
+	return time.Time{}, false
+}
+
+func parseAlarmTime(alarmStr string) (time.Time, bool) {
+	now := time.Now()
+
+	// Try 12-hour format first (1:50PM, 1:50 PM, 1:50pm, etc.)
+	formats12 := []string{"3:04PM", "3:04 PM", "3:04pm", "3:04 pm"}
+	for _, format := range formats12 {
+		if t, err := time.Parse(format, alarmStr); err == nil {
+			alarmTime := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
+			if alarmTime.Before(now) {
+				alarmTime = alarmTime.Add(24 * time.Hour)
+			}
+			return alarmTime, true
+		}
+	}
+
+	// Try 24-hour format (15:04)
+	if t, err := time.Parse("15:04", alarmStr); err == nil {
+		alarmTime := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
+		if alarmTime.Before(now) {
+			alarmTime = alarmTime.Add(24 * time.Hour)
+		}
+		return alarmTime, true
+	}
+
+	return time.Time{}, false
+}
+
+func formatDuration(d time.Duration) string {
+	// If over 8 hours, round to nearest hour
+	if d > 8*time.Hour {
+		hours := d.Round(time.Hour)
+		if hours >= 24*time.Hour {
+			days := int(hours / (24 * time.Hour))
+			remaining := hours % (24 * time.Hour)
+			if remaining == 0 {
+				if days == 1 {
+					return "1 day"
+				}
+				return fmt.Sprintf("%d days", days)
+			} else {
+				hours := int(remaining / time.Hour)
+				if days == 1 {
+					return fmt.Sprintf("1 day %dh", hours)
+				}
+				return fmt.Sprintf("%dd %dh", days, hours)
+			}
+		} else {
+			hours := int(d.Round(time.Hour) / time.Hour)
+			if hours == 1 {
+				return "1 hour"
+			}
+			return fmt.Sprintf("%d hours", hours)
+		}
+	}
+
+	// For under 8 hours, show precise time
+	return d.Truncate(time.Second).String()
+}
+
+func isWSL() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	// Check if we're in WSL by looking for WSL-specific environment variables or files
+	if os.Getenv("WSL_DISTRO_NAME") != "" || os.Getenv("WSLENV") != "" {
+		return true
+	}
+	// Check for WSL filesystem marker
+	if _, err := os.Stat("/proc/version"); err == nil {
+		if data, err := os.ReadFile("/proc/version"); err == nil {
+			return strings.Contains(string(data), "microsoft") || strings.Contains(string(data), "WSL")
+		}
+	}
+	return false
+}
+
+func playNotificationSound() {
+	// Try both mp3 and wav files
+	soundFiles := []string{"assets/notification.mp3", "assets/notification.wav"}
+	var soundFile string
+	for _, file := range soundFiles {
+		if _, err := os.Stat(file); err == nil {
+			soundFile = file
+			break
+		}
+	}
+
+	// If no sound file exists, play system beep
+	if soundFile == "" {
+		if isWSL() {
+			go exec.Command("powershell.exe", "-Command", "[console]::beep(800,200)").Run()
+		} else {
+			go exec.Command("printf", "\a").Run()
+		}
+		return
+	}
+
+	if isWSL() {
+		// In WSL, just use Linux audio players if available
+		players := [][]string{
+			{"mpv", "--no-video", "--really-quiet", "--audio-buffer=1.0", soundFile},
+			{"vlc", "--intf", "dummy", "--play-and-exit", soundFile},
+			{"mplayer", "-really-quiet", soundFile},
+			{"ffplay", "-nodisp", "-autoexit", "-v", "quiet", soundFile},
+		}
+		for _, cmd := range players {
+			if _, err := exec.LookPath(cmd[0]); err == nil {
+				go exec.Command(cmd[0], cmd[1:]...).Run()
+				return
+			}
+		}
+		// If no players available, just beep
+		go exec.Command("powershell.exe", "-Command", "[console]::beep(800,200)").Run()
+		return
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		// Try different audio players (in order of preference)
+		players := [][]string{
+			{"mpv", "--no-video", "--really-quiet", "--audio-buffer=1.0", soundFile},
+			{"vlc", "--intf", "dummy", "--play-and-exit", soundFile},
+			{"mplayer", "-really-quiet", soundFile},
+			{"ffplay", "-nodisp", "-autoexit", "-v", "quiet", soundFile},
+		}
+		for _, cmd := range players {
+			if _, err := exec.LookPath(cmd[0]); err == nil {
+				go exec.Command(cmd[0], cmd[1:]...).Run()
+				return
+			}
+		}
+	case "darwin":
+		// Use afplay on macOS
+		go exec.Command("afplay", soundFile).Run()
+	case "windows":
+		// Use PowerShell to play sound on Windows
+		go exec.Command("powershell", "-Command", fmt.Sprintf(`(New-Object Media.SoundPlayer "%s").PlaySync()`, soundFile)).Run()
+	}
+}
+
+func sendNotification(title, message string) {
+	// Play notification sound
+	playNotificationSound()
+
+	// Send system notification
+	switch runtime.GOOS {
+	case "linux":
+		exec.Command("notify-send", title, message).Run()
+	case "darwin":
+		exec.Command("osascript", "-e", fmt.Sprintf(`display notification "%s" with title "%s"`, message, title)).Run()
+	case "windows":
+		exec.Command("powershell", "-Command", fmt.Sprintf(`[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); [System.Windows.Forms.MessageBox]::Show('%s', '%s')`, message, title)).Run()
+	}
+}
+
+func getMostRecent3AM() time.Time {
+	now := time.Now()
+	today3AM := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, now.Location())
+
+	// If current time is before 3AM today, use yesterday's 3AM
+	if now.Before(today3AM) {
+		return today3AM.AddDate(0, 0, -1)
+	}
+
+	// If current time is after 3AM today, use today's 3AM
+	return today3AM
+}
+
+func resetDailyTasks(data *AppData) bool {
+	mostRecent3AM := getMostRecent3AM()
+	resetOccurred := false
+
+	for i := range data.Dailies {
+		daily := &data.Dailies[i]
+		// Reset to INCOMPLETE if task was completed before the most recent 3AM
+		if daily.Status == "DONE" && daily.LastCompleted.Before(mostRecent3AM) {
+			daily.Status = "INCOMPLETE"
+			daily.LastCompleted = time.Time{} // Reset completion time
+			resetOccurred = true
+		}
+	}
+
+	return resetOccurred
+}
+
+func sortItems(items interface{}, sortBy string) {
+	switch v := items.(type) {
+	case []Daily:
+		sort.Slice(v, func(i, j int) bool {
+			if v[i].Category != v[j].Category {
+				return v[i].Category < v[j].Category
+			}
+			pri := map[string]int{"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+			if pri[v[i].Priority] != pri[v[j].Priority] {
+				return pri[v[i].Priority] < pri[v[j].Priority]
+			}
+			return v[i].Task < v[j].Task
+		})
+	case []RollingTodo:
+		sort.Slice(v, func(i, j int) bool {
+			if v[i].Category != v[j].Category {
+				return v[i].Category < v[j].Category
+			}
+			pri := map[string]int{"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+			if pri[v[i].Priority] != pri[v[j].Priority] {
+				return pri[v[i].Priority] < pri[v[j].Priority]
+			}
+			return v[i].Task < v[j].Task
+		})
+	case []Reminder:
+		sort.Slice(v, func(i, j int) bool {
+			if v[i].Status != v[j].Status {
+				statusOrder := map[string]int{"active": 0, "pending": 1, "completed": 2, "expired": 3}
+				return statusOrder[v[i].Status] < statusOrder[v[j].Status]
+			}
+			return v[i].Reminder < v[j].Reminder
+		})
+	case []GlossaryItem:
+		sort.Slice(v, func(i, j int) bool {
+			if v[i].Lang != v[j].Lang {
+				return v[i].Lang < v[j].Lang
+			}
+			return v[i].Command < v[j].Command
+		})
+	}
+}
+
 func initialModel() model {
 	m := model{
 		activeTab:   1,
 		data:        loadData(),
 		statusColor: "86",
+		lastTick:    time.Now(),
+	}
+
+	// Check for daily task reset on startup
+	if resetDailyTasks(&m.data) {
+		saveData(m.data)
 	}
 
 	m.setupTables()
@@ -167,8 +494,7 @@ func (m *model) setupTables() {
 		table.WithColumns([]table.Column{
 			{Title: "Reminder", Width: 30},
 			{Title: "Note", Width: 35},
-			{Title: "Alarm/Countdown", Width: 15},
-			{Title: "Status", Width: 10},
+			{Title: "Alarm/Countdown", Width: 35},
 		}),
 		table.WithRows(m.reminderRows()),
 		table.WithFocused(true),
@@ -225,15 +551,25 @@ func (m *model) adjustLayout() {
 
 func (m *model) dailyRows() []table.Row {
 	rows := []table.Row{}
+	sortItems(m.data.Dailies, "category")
 	for _, daily := range m.data.Dailies {
 		priority := daily.Priority
+		if priority == "" {
+			priority = "MEDIUM"
+		}
+		priority = strings.ToUpper(priority)
+
+		// Just use plain text for now to test
+		var displayPriority string
 		switch priority {
-		case "High":
-			priority = priorityHighStyle.Render(priority)
-		case "Medium":
-			priority = priorityMedStyle.Render(priority)
-		case "Low":
-			priority = priorityLowStyle.Render(priority)
+		case "HIGH":
+			displayPriority = "HIGH"
+		case "MEDIUM":
+			displayPriority = "MEDIUM"
+		case "LOW":
+			displayPriority = "LOW"
+		default:
+			displayPriority = "MEDIUM"
 		}
 
 		status := daily.Status
@@ -245,9 +581,9 @@ func (m *model) dailyRows() []table.Row {
 		}
 
 		rows = append(rows, table.Row{
-			daily.Task,
-			priority,
-			daily.Category,
+			normalizeText(daily.Task),
+			displayPriority,
+			normalizeText(daily.Category),
 			daily.Deadline,
 			status,
 		})
@@ -257,21 +593,31 @@ func (m *model) dailyRows() []table.Row {
 
 func (m *model) rollingRows() []table.Row {
 	rows := []table.Row{}
+	sortItems(m.data.RollingTodos, "category")
 	for _, todo := range m.data.RollingTodos {
 		priority := todo.Priority
+		if priority == "" {
+			priority = "MEDIUM"
+		}
+		priority = strings.ToUpper(priority)
+
+		// Just use plain text for now to test
+		var displayPriority string
 		switch priority {
-		case "High":
-			priority = priorityHighStyle.Render(priority)
-		case "Medium":
-			priority = priorityMedStyle.Render(priority)
-		case "Low":
-			priority = priorityLowStyle.Render(priority)
+		case "HIGH":
+			displayPriority = "HIGH"
+		case "MEDIUM":
+			displayPriority = "MEDIUM"
+		case "LOW":
+			displayPriority = "LOW"
+		default:
+			displayPriority = "MEDIUM"
 		}
 
 		rows = append(rows, table.Row{
-			todo.Task,
-			priority,
-			todo.Category,
+			normalizeText(todo.Task),
+			displayPriority,
+			normalizeText(todo.Category),
 			todo.Deadline,
 		})
 	}
@@ -280,22 +626,34 @@ func (m *model) rollingRows() []table.Row {
 
 func (m *model) reminderRows() []table.Row {
 	rows := []table.Row{}
+	sortItems(m.data.Reminders, "status")
 	for _, reminder := range m.data.Reminders {
-		status := reminder.Status
-		switch status {
-		case "Active":
-			status = statusPendingStyle.Render(status)
-		case "Completed", "Done":
-			status = statusDoneStyle.Render(status)
-		case "Expired":
-			status = statusOverdueStyle.Render(status)
+		// Display countdown/alarm time
+		displayTime := reminder.AlarmOrCountdown
+		if reminder.Status == "paused" && reminder.PausedRemaining > 0 {
+			// Show paused remaining time
+			if reminder.IsCountdown {
+				displayTime = fmt.Sprintf("%s (PAUSED %s)", reminder.AlarmOrCountdown, reminder.PausedRemaining.Truncate(time.Second))
+			} else {
+				displayTime = fmt.Sprintf("%s (PAUSED)", reminder.AlarmOrCountdown)
+			}
+		} else if !reminder.TargetTime.IsZero() {
+			remaining := time.Until(reminder.TargetTime)
+			if remaining > 0 {
+				if reminder.IsCountdown {
+					displayTime = fmt.Sprintf("%s (%s)", reminder.AlarmOrCountdown, remaining.Truncate(time.Second))
+				} else {
+					displayTime = fmt.Sprintf("%s (%s)", reminder.AlarmOrCountdown, reminder.TargetTime.Format("15:04"))
+				}
+			} else {
+				displayTime = fmt.Sprintf("%s (EXPIRED)", reminder.AlarmOrCountdown)
+			}
 		}
 
 		rows = append(rows, table.Row{
-			reminder.Reminder,
-			reminder.Note,
-			reminder.AlarmOrCountdown,
-			status,
+			normalizeText(reminder.Reminder),
+			normalizeText(reminder.Note),
+			displayTime,
 		})
 	}
 	return rows
@@ -303,16 +661,101 @@ func (m *model) reminderRows() []table.Row {
 
 func (m *model) glossaryRows() []table.Row {
 	rows := []table.Row{}
+	sortItems(m.data.Glossary, "lang")
 	for _, item := range m.data.Glossary {
 		rows = append(rows, table.Row{
-			item.Lang,
-			item.Command,
-			item.Usage,
-			item.Example,
-			item.Meaning,
+			normalizeText(item.Lang),
+			normalizeText(item.Command),
+			normalizeText(item.Usage),
+			normalizeText(item.Example),
+			normalizeText(item.Meaning),
 		})
 	}
 	return rows
+}
+
+func (m *model) toggleReminderStatus(action string) {
+	if m.activeTab != 4 || len(m.data.Reminders) == 0 {
+		return
+	}
+
+	cursor := m.tables[2].Cursor()
+	if cursor >= len(m.data.Reminders) {
+		return
+	}
+
+	reminder := &m.data.Reminders[cursor]
+	var statusMsg string
+	var statusColor string
+
+	switch action {
+	case "start":
+		if reminder.Status == "paused" {
+			// Resume from paused state
+			if reminder.PausedRemaining > 0 {
+				reminder.TargetTime = time.Now().Add(reminder.PausedRemaining)
+				reminder.PausedRemaining = 0
+			}
+			reminder.Status = "active"
+			reminder.Notified = false
+			statusMsg = fmt.Sprintf("▶️ Resumed: %s", reminder.Reminder)
+			statusColor = "82"
+		} else if reminder.Status == "inactive" {
+			reminder.Status = "active"
+			reminder.Notified = false
+			// Re-parse the alarm/countdown
+			if targetTime, isCountdown := parseCountdown(reminder.AlarmOrCountdown); isCountdown {
+				reminder.TargetTime = targetTime
+				reminder.IsCountdown = true
+			} else if targetTime, isAlarm := parseAlarmTime(reminder.AlarmOrCountdown); isAlarm {
+				reminder.TargetTime = targetTime
+				reminder.IsCountdown = false
+			}
+			statusMsg = fmt.Sprintf("▶️ Started: %s", reminder.Reminder)
+			statusColor = "82"
+		} else {
+			statusMsg = fmt.Sprintf("⚠️ %s is already active", reminder.Reminder)
+			statusColor = "226"
+		}
+
+	case "pause":
+		if reminder.Status == "active" {
+			// Store remaining time when pausing
+			if !reminder.TargetTime.IsZero() {
+				reminder.PausedRemaining = time.Until(reminder.TargetTime)
+				if reminder.PausedRemaining < 0 {
+					reminder.PausedRemaining = 0
+				}
+			}
+			reminder.Status = "paused"
+			statusMsg = fmt.Sprintf("⏸️ Paused: %s", reminder.Reminder)
+			statusColor = "226"
+		} else {
+			statusMsg = fmt.Sprintf("⚠️ %s is not active", reminder.Reminder)
+			statusColor = "226"
+		}
+
+	case "reset":
+		reminder.Status = "active"
+		reminder.Notified = false
+		reminder.PausedRemaining = 0 // Clear any paused time
+		// Re-parse and reset the target time
+		if targetTime, isCountdown := parseCountdown(reminder.AlarmOrCountdown); isCountdown {
+			reminder.TargetTime = targetTime
+			reminder.IsCountdown = true
+		} else if targetTime, isAlarm := parseAlarmTime(reminder.AlarmOrCountdown); isAlarm {
+			reminder.TargetTime = targetTime
+			reminder.IsCountdown = false
+		}
+		statusMsg = fmt.Sprintf("🔄 Reset: %s", reminder.Reminder)
+		statusColor = "82"
+	}
+
+	m.tables[2].SetRows(m.reminderRows())
+	saveData(m.data)
+	m.statusMsg = statusMsg
+	m.statusColor = statusColor
+	m.statusExpiry = time.Now().Add(3 * time.Second)
 }
 
 func (m *model) toggleCompletion() {
@@ -331,8 +774,10 @@ func (m *model) toggleCompletion() {
 	switch current {
 	case "DONE":
 		newStatus = "INCOMPLETE"
+		m.data.Dailies[cursor].LastCompleted = time.Time{} // Clear completion time
 	default:
 		newStatus = "DONE"
+		m.data.Dailies[cursor].LastCompleted = time.Now() // Record completion time
 	}
 
 	m.data.Dailies[cursor].Status = newStatus
@@ -351,7 +796,7 @@ func (m *model) toggleCompletion() {
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return tickCmd()
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -361,6 +806,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusColor = msg.color
 		m.statusExpiry = time.Now().Add(3 * time.Second)
 		return m, nil
+
+	case tickMsg:
+		m.lastTick = time.Time(msg)
+
+		// Check for daily task reset (runs every tick but only resets when needed)
+		if resetDailyTasks(&m.data) {
+			m.tables[0].SetRows(m.dailyRows())
+			m.statusMsg = "🌅 Daily tasks reset at 3AM"
+			m.statusColor = "82"
+			m.statusExpiry = time.Now().Add(5 * time.Second)
+			saveData(m.data)
+		}
+
+		// Check for reminder notifications (only for active reminders)
+		for i, reminder := range m.data.Reminders {
+			if !reminder.TargetTime.IsZero() && !reminder.Notified && reminder.Status == "active" && time.Now().After(reminder.TargetTime) {
+				m.data.Reminders[i].Notified = true
+				m.data.Reminders[i].Status = "expired"
+				sendNotification("Reminder", reminder.Reminder)
+				m.statusMsg = fmt.Sprintf("🔔 Reminder: %s", reminder.Reminder)
+				m.statusColor = "226"
+				m.statusExpiry = time.Now().Add(5 * time.Second)
+				saveData(m.data)
+			}
+		}
+		m.tables[2].SetRows(m.reminderRows())
+		return m, tickCmd()
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -410,13 +882,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.activeTab > 1 && m.activeTab < 6 {
 				m.startEditing()
 			}
-		case "n", "a":
+		case "n":
+			if m.confirmDelete {
+				m.confirmDelete = false
+				m.deleteTarget = ""
+				m.statusMsg = "Delete cancelled"
+				m.statusColor = "86"
+				m.statusExpiry = time.Now().Add(2 * time.Second)
+			} else if m.activeTab > 1 && m.activeTab < 6 {
+				m.addNew()
+			}
+		case "a":
 			if m.activeTab > 1 && m.activeTab < 6 {
 				m.addNew()
 			}
 		case "d", "delete":
-			if m.activeTab > 1 && m.activeTab < 6 {
+			if m.activeTab > 1 && m.activeTab < 6 && !m.confirmDelete {
+				m.confirmDeleteSelected()
+			}
+		case "y":
+			if m.confirmDelete {
 				m.deleteSelected()
+				m.confirmDelete = false
+				m.deleteTarget = ""
+			}
+		case "s":
+			if m.activeTab == 4 {
+				m.toggleReminderStatus("start")
+			}
+		case "p":
+			if m.activeTab == 4 {
+				m.toggleReminderStatus("pause")
+			}
+		case "r":
+			if m.activeTab == 4 {
+				m.toggleReminderStatus("reset")
 			}
 		case " ", "enter":
 			// Toggle completion for dailies
@@ -505,7 +1005,7 @@ func (m *model) startEditing() {
 	case 4: // Reminders
 		if m.editingRow < len(m.data.Reminders) {
 			reminder := m.data.Reminders[m.editingRow]
-			m.inputs = make([]textinput.Model, 4)
+			m.inputs = make([]textinput.Model, 3)
 			m.inputs[0] = textinput.New()
 			m.inputs[0].SetValue(reminder.Reminder)
 			m.inputs[0].Focus()
@@ -513,8 +1013,6 @@ func (m *model) startEditing() {
 			m.inputs[1].SetValue(reminder.Note)
 			m.inputs[2] = textinput.New()
 			m.inputs[2].SetValue(reminder.AlarmOrCountdown)
-			m.inputs[3] = textinput.New()
-			m.inputs[3].SetValue(reminder.Status)
 		}
 	case 5: // Glossary
 		if m.editingRow < len(m.data.Glossary) {
@@ -555,7 +1053,7 @@ func (m *model) addNew() {
 		}
 		m.inputs[0].Focus()
 	case 4: // Reminders
-		m.inputs = make([]textinput.Model, 4)
+		m.inputs = make([]textinput.Model, 3)
 		for i := range m.inputs {
 			m.inputs[i] = textinput.New()
 		}
@@ -575,19 +1073,20 @@ func (m *model) saveEdit() {
 		if m.editingRow == -1 {
 			// New item
 			newDaily := Daily{
-				ID:       len(m.data.Dailies) + 1,
-				Task:     m.inputs[0].Value(),
-				Priority: m.inputs[1].Value(),
-				Category: m.inputs[2].Value(),
-				Deadline: m.inputs[3].Value(),
-				Status:   "INCOMPLETE",
+				ID:            len(m.data.Dailies) + 1,
+				Task:          normalizeText(m.inputs[0].Value()),
+				Priority:      normalizePriority(m.inputs[1].Value()),
+				Category:      normalizeText(m.inputs[2].Value()),
+				Deadline:      m.inputs[3].Value(),
+				Status:        "INCOMPLETE",
+				LastCompleted: time.Time{},
 			}
 			m.data.Dailies = append(m.data.Dailies, newDaily)
 		} else {
 			// Edit existing
-			m.data.Dailies[m.editingRow].Task = m.inputs[0].Value()
-			m.data.Dailies[m.editingRow].Priority = m.inputs[1].Value()
-			m.data.Dailies[m.editingRow].Category = m.inputs[2].Value()
+			m.data.Dailies[m.editingRow].Task = normalizeText(m.inputs[0].Value())
+			m.data.Dailies[m.editingRow].Priority = normalizePriority(m.inputs[1].Value())
+			m.data.Dailies[m.editingRow].Category = normalizeText(m.inputs[2].Value())
 			m.data.Dailies[m.editingRow].Deadline = m.inputs[3].Value()
 		}
 		m.tables[0].SetRows(m.dailyRows())
@@ -595,16 +1094,16 @@ func (m *model) saveEdit() {
 		if m.editingRow == -1 {
 			newTodo := RollingTodo{
 				ID:       len(m.data.RollingTodos) + 1,
-				Task:     m.inputs[0].Value(),
-				Priority: m.inputs[1].Value(),
-				Category: m.inputs[2].Value(),
+				Task:     normalizeText(m.inputs[0].Value()),
+				Priority: normalizePriority(m.inputs[1].Value()),
+				Category: normalizeText(m.inputs[2].Value()),
 				Deadline: m.inputs[3].Value(),
 			}
 			m.data.RollingTodos = append(m.data.RollingTodos, newTodo)
 		} else {
-			m.data.RollingTodos[m.editingRow].Task = m.inputs[0].Value()
-			m.data.RollingTodos[m.editingRow].Priority = m.inputs[1].Value()
-			m.data.RollingTodos[m.editingRow].Category = m.inputs[2].Value()
+			m.data.RollingTodos[m.editingRow].Task = normalizeText(m.inputs[0].Value())
+			m.data.RollingTodos[m.editingRow].Priority = normalizePriority(m.inputs[1].Value())
+			m.data.RollingTodos[m.editingRow].Category = normalizeText(m.inputs[2].Value())
 			m.data.RollingTodos[m.editingRow].Deadline = m.inputs[3].Value()
 		}
 		m.tables[1].SetRows(m.rollingRows())
@@ -612,41 +1111,92 @@ func (m *model) saveEdit() {
 		if m.editingRow == -1 {
 			newReminder := Reminder{
 				ID:               len(m.data.Reminders) + 1,
-				Reminder:         m.inputs[0].Value(),
-				Note:             m.inputs[1].Value(),
+				Reminder:         normalizeText(m.inputs[0].Value()),
+				Note:             normalizeText(m.inputs[1].Value()),
 				AlarmOrCountdown: m.inputs[2].Value(),
-				Status:           m.inputs[3].Value(),
+				CreatedAt:        time.Now(),
+				Notified:         false,
+			}
+			// Parse countdown or alarm
+			if targetTime, isCountdown := parseCountdown(m.inputs[2].Value()); isCountdown {
+				newReminder.TargetTime = targetTime
+				newReminder.IsCountdown = true
+				newReminder.Status = "active"
+			} else if targetTime, isAlarm := parseAlarmTime(m.inputs[2].Value()); isAlarm {
+				newReminder.TargetTime = targetTime
+				newReminder.IsCountdown = false
+				newReminder.Status = "active"
 			}
 			m.data.Reminders = append(m.data.Reminders, newReminder)
 		} else {
-			m.data.Reminders[m.editingRow].Reminder = m.inputs[0].Value()
-			m.data.Reminders[m.editingRow].Note = m.inputs[1].Value()
+			m.data.Reminders[m.editingRow].Reminder = normalizeText(m.inputs[0].Value())
+			m.data.Reminders[m.editingRow].Note = normalizeText(m.inputs[1].Value())
 			m.data.Reminders[m.editingRow].AlarmOrCountdown = m.inputs[2].Value()
-			m.data.Reminders[m.editingRow].Status = m.inputs[3].Value()
+			// Re-parse countdown or alarm when editing
+			if targetTime, isCountdown := parseCountdown(m.inputs[2].Value()); isCountdown {
+				m.data.Reminders[m.editingRow].TargetTime = targetTime
+				m.data.Reminders[m.editingRow].IsCountdown = true
+				m.data.Reminders[m.editingRow].Notified = false
+				m.data.Reminders[m.editingRow].Status = "active"
+			} else if targetTime, isAlarm := parseAlarmTime(m.inputs[2].Value()); isAlarm {
+				m.data.Reminders[m.editingRow].TargetTime = targetTime
+				m.data.Reminders[m.editingRow].IsCountdown = false
+				m.data.Reminders[m.editingRow].Notified = false
+				m.data.Reminders[m.editingRow].Status = "active"
+			}
 		}
 		m.tables[2].SetRows(m.reminderRows())
 	case 5: // Glossary
 		if m.editingRow == -1 {
 			newItem := GlossaryItem{
 				ID:      len(m.data.Glossary) + 1,
-				Lang:    m.inputs[0].Value(),
-				Command: m.inputs[1].Value(),
-				Usage:   m.inputs[2].Value(),
-				Example: m.inputs[3].Value(),
-				Meaning: m.inputs[4].Value(),
+				Lang:    normalizeText(m.inputs[0].Value()),
+				Command: normalizeText(m.inputs[1].Value()),
+				Usage:   normalizeText(m.inputs[2].Value()),
+				Example: normalizeText(m.inputs[3].Value()),
+				Meaning: normalizeText(m.inputs[4].Value()),
 			}
 			m.data.Glossary = append(m.data.Glossary, newItem)
 		} else {
-			m.data.Glossary[m.editingRow].Lang = m.inputs[0].Value()
-			m.data.Glossary[m.editingRow].Command = m.inputs[1].Value()
-			m.data.Glossary[m.editingRow].Usage = m.inputs[2].Value()
-			m.data.Glossary[m.editingRow].Example = m.inputs[3].Value()
-			m.data.Glossary[m.editingRow].Meaning = m.inputs[4].Value()
+			m.data.Glossary[m.editingRow].Lang = normalizeText(m.inputs[0].Value())
+			m.data.Glossary[m.editingRow].Command = normalizeText(m.inputs[1].Value())
+			m.data.Glossary[m.editingRow].Usage = normalizeText(m.inputs[2].Value())
+			m.data.Glossary[m.editingRow].Example = normalizeText(m.inputs[3].Value())
+			m.data.Glossary[m.editingRow].Meaning = normalizeText(m.inputs[4].Value())
 		}
 		m.tables[3].SetRows(m.glossaryRows())
 	}
 
 	saveData(m.data)
+}
+
+func (m *model) confirmDeleteSelected() {
+	cursor := m.tables[m.activeTab-2].Cursor()
+	var itemName string
+
+	switch m.activeTab {
+	case 2: // Dailies
+		if cursor < len(m.data.Dailies) {
+			itemName = m.data.Dailies[cursor].Task
+		}
+	case 3: // Rolling Todos
+		if cursor < len(m.data.RollingTodos) {
+			itemName = m.data.RollingTodos[cursor].Task
+		}
+	case 4: // Reminders
+		if cursor < len(m.data.Reminders) {
+			itemName = m.data.Reminders[cursor].Reminder
+		}
+	case 5: // Glossary
+		if cursor < len(m.data.Glossary) {
+			itemName = m.data.Glossary[cursor].Command
+		}
+	}
+
+	if itemName != "" {
+		m.confirmDelete = true
+		m.deleteTarget = itemName
+	}
 }
 
 func (m *model) deleteSelected() {
@@ -719,11 +1269,6 @@ func (m model) View() string {
 	var content string
 
 	if m.activeTab == 1 {
-		// Enhanced home page with summary
-		homeContent := lipgloss.NewStyle().
-			Padding(1).
-			Render("Welcome to lif - Dailies/Reminders Management Dashboard!")
-
 		// Show summary stats
 		totalDailies := len(m.data.Dailies)
 		completedDailies := 0
@@ -732,17 +1277,88 @@ func (m model) View() string {
 				completedDailies++
 			}
 		}
-		summary := fmt.Sprintf("\nStats:\n")
-		summary += fmt.Sprintf("  • Daily Tasks: %d total, %d completed\n", totalDailies, completedDailies)
-		summary += fmt.Sprintf("  • Rolling Todos: %d items\n", len(m.data.RollingTodos))
-		summary += fmt.Sprintf("  • Reminders: %d active\n", len(m.data.Reminders))
-		summary += fmt.Sprintf("  • Glossary: %d entries\n", len(m.data.Glossary))
+		summary := fmt.Sprintf("\nDaily Tasks: %d total, %d completed\n", totalDailies, completedDailies)
+		summary += fmt.Sprintf("Rolling Todos: %d items\n", len(m.data.RollingTodos))
+		summary += fmt.Sprintf("Reminders: %d active\n", len(m.data.Reminders))
+		summary += fmt.Sprintf("Glossary: %d entries\n", len(m.data.Glossary))
 
 		if len(m.data.RollingTodos) > 0 {
-			summary += "\n" + priorityHighStyle.Render("You have items in your Rolling Todo List!")
+			summary += "\n" + priorityHighStyle.Render("Check your Rolling Todo List!")
 		}
 
-		content = homeContent + summary
+		// Show expired reminders
+		expiredReminders := []Reminder{}
+		for _, reminder := range m.data.Reminders {
+			if reminder.Status == "expired" {
+				expiredReminders = append(expiredReminders, reminder)
+			}
+		}
+
+		if len(expiredReminders) > 0 {
+			summary += "\n" + statusOverdueStyle.Render("\nExpired Reminders:") + "\n"
+			for _, reminder := range expiredReminders {
+				summary += fmt.Sprintf("  ⚠️  - %s\n", reminder.Reminder)
+			}
+		}
+
+		// Show active reminders with countdown
+		activeReminders := []Reminder{}
+		for _, reminder := range m.data.Reminders {
+			if !reminder.TargetTime.IsZero() && (reminder.Status == "active" || reminder.Status == "paused") {
+				activeReminders = append(activeReminders, reminder)
+			}
+		}
+
+		// Sort by time remaining (soonest first)
+		sort.Slice(activeReminders, func(i, j int) bool {
+			iRemaining := time.Until(activeReminders[i].TargetTime)
+			jRemaining := time.Until(activeReminders[j].TargetTime)
+
+			// Handle paused reminders - use PausedRemaining for comparison
+			if activeReminders[i].Status == "paused" && activeReminders[i].PausedRemaining > 0 {
+				iRemaining = activeReminders[i].PausedRemaining
+			}
+			if activeReminders[j].Status == "paused" && activeReminders[j].PausedRemaining > 0 {
+				jRemaining = activeReminders[j].PausedRemaining
+			}
+
+			// Sort by remaining time (ascending - soonest first)
+			return iRemaining < jRemaining
+		})
+
+		if len(activeReminders) > 0 {
+			summary += "\n\n" + priorityHighStyle.Render("Active Reminders:") + "\n"
+			for _, reminder := range activeReminders {
+				statusIcon := "🕐"
+				if reminder.Status == "paused" {
+					statusIcon = "⏸️"
+					// Show paused remaining time
+					if reminder.PausedRemaining > 0 {
+						if reminder.IsCountdown {
+							summary += fmt.Sprintf("  %s %s: %s (PAUSED)\n", statusIcon, reminder.Reminder, formatDuration(reminder.PausedRemaining))
+						} else {
+							summary += fmt.Sprintf("  %s %s: PAUSED\n", statusIcon, reminder.Reminder)
+						}
+					} else {
+						summary += fmt.Sprintf("  %s %s: PAUSED\n", statusIcon, reminder.Reminder)
+					}
+				} else {
+					// Active reminder - show live countdown
+					remaining := time.Until(reminder.TargetTime)
+					if remaining > 0 {
+						if reminder.IsCountdown {
+							summary += fmt.Sprintf("  %s %s: %s\n", statusIcon, reminder.Reminder, formatDuration(remaining))
+						} else {
+							summary += fmt.Sprintf("  %s %s: %s\n", statusIcon, reminder.Reminder, reminder.TargetTime.Format("15:04"))
+						}
+					} else {
+						summary += fmt.Sprintf("  ⚠️ %s: EXPIRED\n", reminder.Reminder)
+					}
+				}
+			}
+		}
+
+		content = summary
 	} else {
 		// Table content
 		content = m.tables[m.activeTab-2].View()
@@ -760,15 +1376,26 @@ func (m model) View() string {
 		if m.activeTab == 2 {
 			commands = append(commands, keyStyle.Render("space/enter")+": "+actionStyle.Render("toggle done"))
 		}
+		if m.activeTab == 4 {
+			commands = append(commands, keyStyle.Render("s")+": "+actionStyle.Render("start/resume"))
+			commands = append(commands, keyStyle.Render("p")+": "+actionStyle.Render("pause"))
+			commands = append(commands, keyStyle.Render("r")+": "+actionStyle.Render("reset"))
+		}
 	}
 	commands = append(commands, keyStyle.Render("q")+": "+actionStyle.Render("quit"))
 
 	commandRow := strings.Join(commands, bulletStyle.Render(" • "))
 
-	// Status message with expiry
-	if m.statusMsg != "" && time.Now().Before(m.statusExpiry) {
+	// Status message (no expiry)
+	if m.statusMsg != "" {
 		statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.statusColor))
 		commandRow += "\n> " + statusStyle.Render(m.statusMsg)
+	}
+
+	// Delete confirmation message
+	if m.confirmDelete {
+		deleteStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+		commandRow += "\n> " + deleteStyle.Render(fmt.Sprintf("Delete '%s'? Press 'y' to confirm, 'n' to cancel", m.deleteTarget))
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Top,
@@ -791,7 +1418,7 @@ func (m model) editView() string {
 	case 3: // Rolling Todos
 		labels = []string{"Task:", "Priority:", "Category:", "Deadline:"}
 	case 4: // Reminders
-		labels = []string{"Reminder:", "Note:", "Alarm/Countdown:", "Status:"}
+		labels = []string{"Reminder:", "Note:", "Alarm/Countdown:"}
 	case 5: // Glossary
 		labels = []string{"Lang:", "Command:", "Usage:", "Example:", "Meaning:"}
 	}
@@ -821,7 +1448,7 @@ func loadData() AppData {
 		log.Fatal(err)
 	}
 
-	configPath := filepath.Join(configDir, "daily-tasks", "config.json")
+	configPath := filepath.Join(configDir, "lif", "config.json")
 
 	// Create directory if it doesn't exist
 	os.MkdirAll(filepath.Dir(configPath), 0755)
@@ -845,6 +1472,23 @@ func loadData() AppData {
 	}
 
 	json.Unmarshal(file, &data)
+
+	// Initialize reminders that need parsing
+	for i := range data.Reminders {
+		reminder := &data.Reminders[i]
+		if reminder.TargetTime.IsZero() && reminder.AlarmOrCountdown != "" {
+			if targetTime, isCountdown := parseCountdown(reminder.AlarmOrCountdown); isCountdown {
+				reminder.TargetTime = targetTime
+				reminder.IsCountdown = true
+				reminder.Status = "active"
+			} else if targetTime, isAlarm := parseAlarmTime(reminder.AlarmOrCountdown); isAlarm {
+				reminder.TargetTime = targetTime
+				reminder.IsCountdown = false
+				reminder.Status = "active"
+			}
+		}
+	}
+
 	return data
 }
 
