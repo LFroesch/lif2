@@ -407,7 +407,7 @@ func sortItems(items interface{}, sortBy string) {
 	case []Daily:
 		sort.Slice(v, func(i, j int) bool {
 			if v[i].Category != v[j].Category {
-				return v[i].Category < v[j].Category
+				return strings.ToLower(v[i].Category) < strings.ToLower(v[j].Category)
 			}
 			pri := map[string]int{"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 			if pri[v[i].Priority] != pri[v[j].Priority] {
@@ -418,7 +418,7 @@ func sortItems(items interface{}, sortBy string) {
 	case []RollingTodo:
 		sort.Slice(v, func(i, j int) bool {
 			if v[i].Category != v[j].Category {
-				return v[i].Category < v[j].Category
+				return strings.ToLower(v[i].Category) < strings.ToLower(v[j].Category)
 			}
 			pri := map[string]int{"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 			if pri[v[i].Priority] != pri[v[j].Priority] {
@@ -1498,7 +1498,7 @@ func saveData(data AppData) {
 		log.Fatal(err)
 	}
 
-	configPath := filepath.Join(configDir, "daily-tasks", "config.json")
+	configPath := filepath.Join(configDir, "lif", "config.json")
 
 	file, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
